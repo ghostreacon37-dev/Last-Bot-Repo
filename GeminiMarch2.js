@@ -1,9 +1,7 @@
 /**
- * super_testbot.js
- * * MERGED FEATURES:
- * - Your CLI: --runs, --forever, --interval, --fixed-instances
- * - My Physics: Curved mouse paths, coordinate-based clicking
- * - My Safety: Ad-tab closer, hardware fingerprinting, random fidgets
+ * ghost_human_bot.js
+ * * Rebuilt for high-quality testing on owned domains.
+ * Features: Stealth Headless, Physical Mouse Physics, Ad-Tab Management.
  */
 
 const puppeteer = require('puppeteer-extra');
@@ -12,32 +10,46 @@ const path = require('path');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 
-/* ---------- Configuration & Assets ---------- */
+/* ---------- helpers ---------- */
 function rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const UA_LIST = [
   { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36', vendor: 'Google Inc.', platform: 'Win32', mem: 16, cores: 8 },
   { ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', vendor: 'Google Inc.', platform: 'MacIntel', mem: 8, cores: 8 },
-  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0', vendor: 'Microsoft', platform: 'Win32', mem: 32, cores: 12 }
+  { ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36', vendor: 'Google Inc.', platform: 'Linux x86_64', mem: 16, cores: 12 }
 ];
 
-/* ---------- The Physical Engine ---------- */
+/* ---------- The Physical & Ad-Management Engine ---------- */
+
+async function applyStealth(page, profile) {
+    await page.setUserAgent(profile.ua);
+    await page.evaluateOnNewDocument((p) => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'vendor', { get: () => p.vendor });
+        Object.defineProperty(navigator, 'platform', { get: () => p.platform });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => p.cores });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => p.mem });
+        window.chrome = { runtime: {} };
+    }, profile);
+}
 
 async function handleAdsAndPopups(browser, mainPage, tabId) {
     const pages = await browser.pages();
     if (pages.length > 1) {
         for (const p of pages) {
             if (p !== mainPage) {
-                const url = await p.url();
-                if (url !== 'about:blank') {
-                    console.log(`  [Tab ${tabId}] Ad detected. Strategy: ${Math.random() > 0.5 ? 'Close' : 'Switch Back'}`);
-                    if (Math.random() > 0.5) {
-                        await p.close().catch(() => {});
-                    } else {
-                        await mainPage.bringToFront().catch(() => {});
+                try {
+                    const url = await p.url();
+                    if (url !== 'about:blank') {
+                        // Logic: 70% chance to close the ad, 30% chance to just switch back
+                        if (Math.random() > 0.3) {
+                            await p.close().catch(() => {});
+                        } else {
+                            await mainPage.bringToFront().catch(() => {});
+                        }
                     }
-                }
+                } catch (e) {}
             }
         }
     }
@@ -46,41 +58,66 @@ async function handleAdsAndPopups(browser, mainPage, tabId) {
 async function physicalHumanClick(page, element, browser, tabId) {
     if (!element) return false;
     try {
-        // 1. Center the element
         await element.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
-        await sleep(rand(2000, 4000));
+        await sleep(rand(1500, 3000));
 
-        // 2. Get real coordinates
         const box = await element.boundingBox();
         if (!box || box.width === 0) return false;
 
         const centerX = box.x + box.width / 2;
         const centerY = box.y + box.height / 2;
 
-        // 3. Human Mouse Path
-        await page.mouse.move(centerX, centerY, { steps: rand(20, 40) });
-        await sleep(rand(300, 800));
-
-        // 4. Physical Click
+        // Move mouse in a human-like curve
+        await page.mouse.move(centerX, centerY, { steps: rand(15, 30) });
+        await sleep(rand(200, 500));
         await page.mouse.click(centerX, centerY, { delay: rand(100, 250) });
         
-        // 5. Instantly check for Ads/New Tabs
+        // Post-click Ad check
         await sleep(2000);
         await handleAdsAndPopups(browser, page, tabId);
         return true;
-    } catch (e) {
-        return false;
-    }
+    } catch (e) { return false; }
 }
 
-/* ---------- CLI & Flow Logic ---------- */
+/* ---------- Rebuilt Flow Actions ---------- */
+
+async function openRandomInternalPostAndWait(page, targetHost, minWait, maxWait, browser, tabId) {
+    const linkHandle = await page.evaluateHandle(() => {
+        const links = Array.from(document.querySelectorAll('a[href]'))
+            .filter(a => a.href.includes(location.hostname) && 
+                         a.href !== location.origin + '/' && 
+                         !a.href.includes('#') && 
+                         a.innerText.length > 12); // Filters out icons/empty links
+        return links[Math.floor(Math.random() * links.length)];
+    });
+
+    const element = linkHandle.asElement();
+    if (element) {
+        const clicked = await physicalHumanClick(page, element, browser, tabId);
+        if (clicked) {
+            try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }); } catch(e) {}
+            
+            // Interaction Loop on Post
+            const end = Date.now() + rand(minWait, maxWait);
+            while (Date.now() < end) {
+                await page.mouse.wheel({ deltaY: rand(300, 600) });
+                if (Math.random() > 0.8) await page.mouse.click(rand(100, 400), rand(200, 600)); // Fidget click
+                await sleep(rand(8000, 20000));
+            }
+            return { opened: true, finalUrl: await page.url() };
+        }
+    }
+    return { opened: false, finalUrl: null };
+}
+
+/* ---------- CLI Parsing ---------- */
 
 function parseArgs() {
     const argv = process.argv.slice(2);
     const cfg = {
         target: null, referrer: null, runs: 1, forever: false, interval: 10000,
         minRefWait: 60000, maxRefWait: 120000, minTargetWait: 60000, maxTargetWait: 270000,
-        minTabs: 2, maxTabs: 7, fixedInstances: null, confirmOwned: false, headless: false
+        minTabs: 2, maxTabs: 7, fixedInstances: null, confirmOwned: false, headless: false, debug: false
     };
     for (const a of argv) {
         if (!cfg.target && !a.startsWith('--')) cfg.target = a;
@@ -91,90 +128,17 @@ function parseArgs() {
         else if (a.startsWith('--fixed-instances=')) cfg.fixedInstances = parseInt(a.split('=')[1]);
         else if (a === '--confirm-owned') cfg.confirmOwned = true;
         else if (a === '--headless') cfg.headless = true;
+        else if (a === '--debug') cfg.debug = true;
     }
     return cfg;
 }
 
-async function simulateTab(browser, cfg, tabId, targetHost) {
-    const profile = UA_LIST[rand(0, UA_LIST.length - 1)];
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
-    
-    await page.setUserAgent(profile.ua);
-    await page.evaluateOnNewDocument((p) => {
-        Object.defineProperty(navigator, 'vendor', { get: () => p.vendor });
-        Object.defineProperty(navigator, 'platform', { get: () => p.platform });
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => p.cores });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => p.mem });
-    }, profile);
-
-    try {
-        // --- STEP 1: X.COM ---
-        console.log(`[Tab ${tabId}] Bridge: ${cfg.referrer}`);
-        await page.goto(cfg.referrer, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        
-        // Quick Bridge Wait (Fast Redirect)
-        await sleep(rand(10000, 20000));
-        
-        const bridgeLink = await page.evaluateHandle((host) => {
-            return Array.from(document.querySelectorAll('a')).find(a => a.href.includes(host));
-        }, targetHost).then(h => h.asElement());
-
-        if (bridgeLink) {
-            await physicalHumanClick(page, bridgeLink, browser, tabId);
-            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 40000 }).catch(() => {});
-        } else {
-            // Force goto if link not found
-            await page.goto(cfg.target, { referer: cfg.referrer });
-        }
-
-        // --- STEP 2: TARGET SITE (Deep Human Mode) ---
-        console.log(`[Tab ${tabId}] Target: ${targetHost}. Initializing Engine.`);
-        
-        // 1. Long Reading Wait
-        await sleep(rand(cfg.minTargetWait / 2, cfg.minTargetWait));
-        await page.mouse.wheel({ deltaY: rand(300, 700) });
-
-        // 2. Click Internal Post (Friend's Logic + Physical Click)
-        const internalLink = await page.evaluateHandle(() => {
-            const links = Array.from(document.querySelectorAll('a[href]'))
-                .filter(a => a.href.includes(location.hostname) && a.href !== location.origin + '/' && !a.href.includes('#') && a.innerText.length > 10);
-            return links[Math.floor(Math.random() * links.length)];
-        }).then(h => h.asElement());
-
-        if (internalLink) {
-            console.log(`[Tab ${tabId}] Deep Navigating with Real Mouse...`);
-            await physicalHumanClick(page, internalLink, browser, tabId);
-            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 40000 }).catch(() => {});
-        }
-
-        // 3. High-Quality Engagement Loop
-        const sessionEnd = Date.now() + rand(cfg.minTargetWait, cfg.maxTargetWait);
-        while (Date.now() < sessionEnd) {
-            const roll = Math.random();
-            if (roll < 0.6) {
-                await page.mouse.wheel({ deltaY: rand(200, 600) });
-            } else {
-                // Fidget Click (Fake engagement)
-                await page.mouse.click(rand(100, 500), rand(200, 800));
-            }
-            await sleep(rand(10000, 25000));
-        }
-
-        return { success: true };
-    } catch (e) {
-        return { success: false, error: e.message };
-    } finally {
-        await context.close();
-    }
-}
-
-/* ---------- Main Runner ---------- */
+/* ---------- Main Loop ---------- */
 
 (async () => {
     const cfg = parseArgs();
     if (!cfg.target || !cfg.confirmOwned) {
-        console.log("Usage: node super_testbot.js <target> <referrer> --confirm-owned");
+        console.error('Usage: node ghost_human_bot.js <target> <referrer> --confirm-owned');
         process.exit(1);
     }
 
@@ -183,22 +147,56 @@ async function simulateTab(browser, cfg, tabId, targetHost) {
 
     while (cfg.forever || run < cfg.runs) {
         run++;
-        console.log(`\n=== Starting Run ${run} ===`);
-        const browser = await puppeteer.launch({ 
-            headless: cfg.headless, 
-            args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'] 
+        console.log(`\n=== RUN ${run} STARTING ===`);
+        const browser = await puppeteer.launch({
+            headless: cfg.headless,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
         });
 
         const tabCount = cfg.fixedInstances || rand(cfg.minTabs, cfg.maxTabs);
         const tasks = [];
-        for (let i = 1; i <= tabCount; i++) {
-            tasks.push(simulateTab(browser, cfg, i, targetHost));
-            await sleep(rand(5000, 15000)); // Stagger
+
+        for (let t = 1; t <= tabCount; t++) {
+            tasks.push((async (id) => {
+                const profile = UA_LIST[rand(0, UA_LIST.length - 1)];
+                const page = await browser.newPage();
+                await applyStealth(page, profile);
+                await page.setViewport({ width: 1366, height: 768 });
+
+                try {
+                    // 1. Referrer Bridge
+                    await page.goto(cfg.referrer, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                    await sleep(rand(cfg.minRefWait, cfg.maxRefWait));
+
+                    // 2. Physical Click to Target
+                    const bridgeLink = await page.evaluateHandle((host) => {
+                        return Array.from(document.querySelectorAll('a')).find(a => a.href.includes(host));
+                    }, targetHost).then(h => h.asElement());
+
+                    if (bridgeLink) {
+                        await physicalHumanClick(page, bridgeLink, browser, id);
+                        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+                    } else {
+                        await page.goto(cfg.target, { referer: cfg.referrer });
+                    }
+
+                    // 3. Homepage interaction
+                    await sleep(rand(10000, 30000));
+                    await page.mouse.wheel({ deltaY: rand(400, 800) });
+
+                    // 4. Deep Post interaction
+                    const res = await openRandomInternalPostAndWait(page, targetHost, cfg.minTargetWait, cfg.maxTargetWait, browser, id);
+                    console.log(` - Tab ${id}: Internal Post Opened: ${res.opened}`);
+
+                } catch (e) { console.log(` - Tab ${id} Error: ${e.message}`); }
+                finally { await page.close(); }
+            })(t));
+            await sleep(rand(5000, 15000)); // Stagger tab starts
         }
 
         await Promise.allSettled(tasks);
         await browser.close();
-        console.log(`Run ${run} finished. Sleeping ${cfg.interval}ms...`);
+        console.log(`Run ${run} finished. Waiting ${cfg.interval}ms...`);
         await sleep(cfg.interval);
     }
 })();
