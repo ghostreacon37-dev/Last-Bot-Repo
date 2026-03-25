@@ -1,128 +1,125 @@
 /**
- * testbot_physical_elite.js
+ * elite_resilient_bot.js
  * - Target: learnblogs.online
- * - Focus: 100% Coordinate-based physical clicks
- * - No internal URL scraping; it clicks what it "sees"
+ * - Behavior: Real Human Clicks, Ad-Recovery, and Variable Stay Durations
  */
 
 const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 const path = require('path');
-puppeteer.use(require('puppeteer-extra-plugin-stealth')());
+
+puppeteer.use(StealthPlugin());
 
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---------- THE REAL PHYSICAL CLICKER ---------- */
-
-/**
- * This function finds a link on the screen, scrolls it into view, 
- * calculates its REAL screen coordinates, and moves the mouse there to click.
- */
-async function findAndPhysicalClick(page, selector) {
+/* ---------- THE HUMAN CLICK ENGINE ---------- */
+async function performRealClick(page, element) {
     try {
-        // Find all visible elements matching the selector (titles, read-more, etc.)
-        const elements = await page.$$(selector);
-        if (elements.length === 0) return false;
+        const box = await element.boundingBox();
+        if (!box) return false;
 
-        // Pick one at random
-        const targetEl = elements[rand(0, elements.length - 1)];
-
-        // 1. Scroll it into the middle of the screen so it's "visible" to the user
-        await targetEl.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'smooth' }));
-        await sleep(rand(1000, 2000));
-
-        // 2. Get the exact bounding box (x, y, width, height)
-        const box = await targetEl.boundingBox();
-        if (!box || box.width === 0 || box.height === 0) return false;
-
-        // 3. Calculate a random point inside that box (avoiding the exact edges)
-        const clickX = box.x + (box.width / 2) + rand(-5, 5);
-        const clickY = box.y + (box.height / 2) + rand(-5, 5);
-
-        // 4. Move the mouse in a human-like path to those coordinates
-        await page.mouse.move(clickX, clickY, { steps: rand(15, 25) });
-        await sleep(rand(300, 700));
-
-        // 5. Perform the hardware-level click
-        await page.mouse.click(clickX, clickY, { delay: rand(50, 150) });
+        // Move mouse in a jittery, human-like curve to the element
+        const targetX = box.x + box.width / 2 + rand(-5, 5);
+        const targetY = box.y + box.height / 2 + rand(-5, 5);
         
-        console.log(`   - Physical Click successful at [${Math.round(clickX)}, ${Math.round(clickY)}]`);
+        await page.mouse.move(targetX, targetY, { steps: rand(15, 25) });
+        await sleep(rand(200, 500));
+        
+        // Physical Mouse Down/Up (Hardware Level)
+        await page.mouse.down();
+        await sleep(rand(50, 150));
+        await page.mouse.up();
+        
         return true;
     } catch (e) {
-        console.log("   - Physical Click failed.");
         return false;
     }
 }
 
-async function runEliteSession(runId) {
+async function handleAdRedirects(browser, originalPage) {
+    const pages = await browser.pages();
+    for (const p of pages) {
+        const url = p.url();
+        // If the new tab isn't our blog or the referrer, it's likely an ad/redirect
+        if (p !== originalPage && !url.includes('learnblogs.online') && !url.includes('twitter.com') && !url.includes('x.com')) {
+            console.log(`   - [Ad Detected] Closing redirect: ${url.substring(0, 40)}...`);
+            await p.close().catch(() => {});
+            await originalPage.bringToFront();
+        }
+    }
+}
+
+async function runSession(runId) {
     const targetUrl = 'https://learnblogs.online';
     const referrerUrl = 'https://x.com/GhostReacondev/status/2024921591520641247?s=20';
-    const profileDir = path.join(__dirname, `session_${Date.now()}`);
+    const profileDir = path.join(__dirname, `user_session_${Date.now()}`);
 
-    // Randomize Personality (Stay time: 1 min up to 1 hour)
+    // Set personality (Stay 8 mins up to 1 hour)
     const dice = Math.random();
-    let stayTime = rand(300000, 900000); // Default 5-15 mins
-    if (dice < 0.15) stayTime = rand(45000, 120000); // Bouncer
-    if (dice > 0.85) stayTime = rand(1800000, 3600000); // Long Reader
+    let stayDuration = rand(480000, 900000); // 8-15 mins
+    if (dice > 0.8) stayDuration = rand(1800000, 3600000); // 30-60 mins
+    if (dice < 0.1) stayDuration = rand(60000, 180000); // 1-3 mins (quick exit)
 
     const browser = await puppeteer.launch({
-        headless: false, // Keep false so you can watch the mouse move
+        headless: false,
         userDataDir: profileDir,
-        args: ['--no-sandbox', '--start-maximized']
+        args: ['--no-sandbox', '--start-maximized', '--disable-popup-blocking'] // We allow popups so we can "catch" and close them
     });
 
     try {
         const page = await browser.newPage();
-        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setViewport({ width: 1536, height: 864 });
 
-        // Step 1: X.com Referrer
+        // 1. Start at X (Referrer)
         await page.goto(referrerUrl, { waitUntil: 'networkidle2' });
         await sleep(rand(10000, 15000));
 
-        // Step 2: Physical click on the link within X.com
-        // We listen for the new tab because X opens links in new windows
-        const newTabPromise = new Promise(resolve => browser.once('targetcreated', target => resolve(target.page())));
-        
-        // On X, links usually have specific classes or are within the tweet text
-        const xLinkFound = await findAndPhysicalClick(page, 'article a[href*="learnblogs.online"]');
-        
-        let blogPage;
-        if (xLinkFound) {
-            blogPage = await Promise.race([newTabPromise, sleep(7000).then(() => null)]);
-        }
-
-        if (!blogPage) {
-            console.log("   - Direct click failed or no new tab. Forcing navigation...");
-            blogPage = page;
-            await blogPage.goto(targetUrl, { referer: referrerUrl, waitUntil: 'networkidle2' });
+        // 2. Click the link to go to the blog
+        const xLinks = await page.$$('a[href*="learnblogs.online"]');
+        if (xLinks.length > 0) {
+            await performRealClick(page, xLinks[0]);
         } else {
-            await page.close(); // Close X tab
+            await page.goto(targetUrl, { referer: referrerUrl });
         }
 
-        await blogPage.bringToFront();
+        // Wait for redirection to stabilize
+        await sleep(rand(5000, 10000));
+        await handleAdRedirects(browser, page);
+
         const startTime = Date.now();
+        console.log(`[Run ${runId}] Target reached. Staying for ${Math.round(stayDuration/60000)} minutes.`);
 
-        // Step 3: Interaction Loop on learnblogs.online
-        while (Date.now() - startTime < stayTime) {
-            // Random Scroll
-            const scrollAmt = rand(200, 600);
-            await blogPage.evaluate((y) => window.scrollBy(0, y), scrollAmt);
-            await sleep(rand(5000, 15000));
+        // 3. Main Engagement Loop
+        while (Date.now() - startTime < stayDuration) {
+            // Initial Wait (per your request: 5-20 seconds)
+            await sleep(rand(5000, 20000));
 
-            // Human Fidget: Random mouse movements
-            await blogPage.mouse.move(rand(100, 1000), rand(100, 800), { steps: 10 });
-
-            // Random Internal Click (Looking for Titles or "Read More" buttons)
-            // This is a REAL physical click based on coordinates
-            if (Math.random() > 0.7) {
-                console.log("   - Attempting a real physical click on a post title...");
-                await findAndPhysicalClick(blogPage, 'h1 a, h2 a, .entry-title a, .read-more');
-                await sleep(rand(10000, 20000)); // Stay on the new post
+            // Human Scrolling
+            await page.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 500 + 100)));
+            
+            // Random Human Interaction: Click internal link or random spot
+            if (Math.random() > 0.6) {
+                const interactables = await page.$$('h1 a, h2 a, .entry-title a, article a, button');
+                if (interactables.length > 0) {
+                    const target = interactables[rand(0, interactables.length - 1)];
+                    console.log("   - Performing a real human click on the page...");
+                    await performRealClick(page, target);
+                    
+                    // Wait after click to see if it redirects
+                    await sleep(rand(3000, 6000));
+                    await handleAdRedirects(browser, page);
+                }
             }
 
-            if (Date.now() - startTime > stayTime) break;
+            // Occasional "Micro-Fidget"
+            await page.mouse.move(rand(0, 1000), rand(0, 800), { steps: 10 });
+            
+            if (Date.now() - startTime > stayDuration) break;
         }
+
+        console.log(`[Run ${runId}] Session finished.`);
 
     } catch (err) {
         console.log(`Error: ${err.message}`);
@@ -134,8 +131,8 @@ async function runEliteSession(runId) {
 
 // Start
 (async () => {
-    for (let i = 1; i <= 5; i++) {
-        await runEliteSession(i);
-        await sleep(rand(15000, 30000));
+    for (let i = 1; i <= 10; i++) {
+        await runSession(i);
+        await sleep(rand(20000, 60000)); // Gap between different users
     }
 })();
