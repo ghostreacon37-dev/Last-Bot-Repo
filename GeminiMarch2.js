@@ -1,131 +1,152 @@
+/**
+ * upgraded_testbot.js
+ * * ADDED: 
+ * - Real Mouse Physics (moves to coordinates before clicking)
+ * - Ad-Tab Management (Closes or switches away from pop-ups)
+ * - Natural Scrolling bursts
+ */
+
 const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
+const fs = require('fs');
+const path = require('path');
+puppeteer.use(require('puppeteer-extra-plugin-stealth')());
 
-const PROFILES = [
-    { name: 'Chrome-Win', vendor: 'Google Inc.', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', w: 1920, h: 1080, cores: 8, mem: 16 },
-    { name: 'Edge-Win', vendor: 'Microsoft', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0', w: 2560, h: 1440, cores: 12, mem: 32 },
-    { name: 'Safari-Mac', vendor: 'Apple Computer, Inc.', ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15', w: 1440, h: 900, cores: 8, mem: 16 }
-];
+/* ---------- helpers ---------- */
+function rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-const hWait = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
+// PHYSICAL MOUSE ENGINE
+async function physicalClick(page, element, tabIndex) {
+  if (!element) return false;
+  try {
+    // 1. Move into view
+    await element.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+    await sleep(rand(1500, 3000));
 
-// THE PHYSICAL ENGINE: Moves mouse, hovers, then clicks
-async function humanClick(page, element) {
-    try {
-        await element.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
-        await new Promise(r => setTimeout(r, 2000));
-        const box = await element.boundingBox();
-        if (box) {
-            const x = box.x + box.width / 2;
-            const y = box.y + box.height / 2;
-            // Move mouse in steps to look like a hand moving
-            await page.mouse.move(x, y, { steps: hWait(15, 25) });
-            await new Promise(r => setTimeout(r, 500)); 
-            await page.mouse.click(x, y, { delay: hWait(100, 250) });
-            return true;
-        }
-    } catch (e) { return false; }
+    // 2. Get coordinates
+    const box = await element.boundingBox();
+    if (!box || box.width === 0) return false;
+
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+
+    // 3. Realistic Mouse Movement
+    await page.mouse.move(x, y, { steps: rand(15, 30) });
+    await sleep(rand(200, 600));
+
+    // 4. Actual Click
+    await page.mouse.click(x, y, { delay: rand(100, 300) });
+    return true;
+  } catch (e) {
+    console.log(`  [Tab ${tabIndex}] Click failed: ${e.message}`);
     return false;
+  }
 }
 
-async function startSession(browser, targetDomain, referrer, id) {
-    const profile = PROFILES[hWait(0, PROFILES.length - 1)];
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
-
-    // Fingerprint Setup
-    await page.setUserAgent(profile.ua);
-    await page.setViewport({ width: profile.w, height: profile.h });
-    await page.evaluateOnNewDocument((p) => {
-        Object.defineProperty(navigator, 'vendor', { get: () => p.vendor });
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => p.cores });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => p.mem });
-    }, profile);
-
-    try {
-        // --- STEP 1: X.COM BRIDGE ---
-        console.log(`[${id}] Bridge: X.com`);
-        await page.goto(referrer, { waitUntil: 'domcontentloaded' });
-        await new Promise(r => setTimeout(r, 8000)); // Fast wait
-
-        const bridgeLink = await page.evaluateHandle((dom) => {
-            return Array.from(document.querySelectorAll('a')).find(a => a.href.includes(dom));
-        }, targetDomain).then(h => h.asElement());
-
-        if (bridgeLink) {
-            await bridgeLink.click(); // Simple click for the bridge
-            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+// AD HANDLER: Closes popups or switches back if we are redirected
+async function handlePopups(browser, originalPage, tabIndex) {
+  const pages = await browser.pages();
+  if (pages.length > 1) {
+    for (const p of pages) {
+      if (p !== originalPage) {
+        const url = await p.url();
+        // Sometime close, sometime just ignore (switch back)
+        if (Math.random() > 0.5) {
+          console.log(`  [Tab ${tabIndex}] Closing Ad Popup: ${url.substring(0, 30)}...`);
+          await p.close().catch(() => {});
+        } else {
+          console.log(`  [Tab ${tabIndex}] Switching back from Ad to Main.`);
+          await originalPage.bringToFront().catch(() => {});
         }
-
-        // --- STEP 2: BLOG HUMAN BEHAVIOR ---
-        console.log(`[${id}] Landing: ${targetDomain}. Starting Human Engine.`);
-        
-        // 1. Initial "Read"
-        await new Promise(r => setTimeout(r, hWait(10000, 20000)));
-
-        // 2. The Internal Post Hunter (Retry Loop)
-        let clickedPost = false;
-        for (let attempt = 0; attempt < 3; attempt++) {
-            const postLink = await page.evaluateHandle(() => {
-                const links = Array.from(document.querySelectorAll('a[href]'))
-                    .filter(a => a.href.includes(location.hostname) && 
-                                 a.href !== location.origin + '/' && 
-                                 !a.href.includes('#') &&
-                                 a.innerText.length > 5); // Avoid tiny icons
-                return links[Math.floor(Math.random() * links.length)];
-            }).then(h => h.asElement());
-
-            if (postLink) {
-                console.log(`[${id}] Internal post found. Moving mouse...`);
-                clickedPost = await humanClick(page, postLink);
-                if (clickedPost) {
-                    await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
-                    break; 
-                }
-            } else {
-                // Scroll down to find more links if none found
-                await page.mouse.wheel({ deltaY: 800 });
-                await new Promise(r => setTimeout(r, 3000));
-            }
-        }
-
-        // 3. Post-Click Activity (Reading the post)
-        if (clickedPost) {
-            console.log(`[${id}] Successfully on Internal Post. Engaging...`);
-            const end = Date.now() + hWait(120000, 300000); // 2-5 min session
-            while (Date.now() < end) {
-                await page.mouse.wheel({ deltaY: hWait(200, 600) });
-                // Random Fidget
-                if (Math.random() > 0.7) {
-                    await page.mouse.move(hWait(100, 800), hWait(100, 600), { steps: 10 });
-                }
-                await new Promise(r => setTimeout(r, hWait(10000, 20000)));
-            }
-        }
-
-    } catch (e) {
-        console.log(`[${id}] Stopped: ${e.message}`);
-    } finally {
-        await context.close();
-        console.log(`[${id}] Done.`);
+      }
     }
+  }
 }
 
-async function run() {
-    const TARGET = "learnwithblog.xyz";
-    const REF = "https://x.com/GhostReacondev/status/2013213212175724818?s=20";
+/* ---------- Re-Integrated Functions ---------- */
+
+async function waitOnReferrer(page, minMs, maxMs, debug=false) {
+  const wait = rand(minMs, maxMs);
+  const start = Date.now();
+  while (Date.now() - start < wait) {
+    // Micro-movements while waiting
+    const vw = page.viewport();
+    await page.mouse.move(rand(0, vw.width), rand(0, vw.height), { steps: 5 });
+    await page.evaluate(() => window.scrollBy(0, Math.floor((Math.random()*40)-20)));
+    await sleep(rand(3000, 10000));
+  }
+}
+
+async function clickLinkToTarget(page, targetHost, browser, tabIndex) {
+  await sleep(rand(2000, 5000));
+  
+  const linkHandle = await page.evaluateHandle((host) => {
+    const anchors = Array.from(document.querySelectorAll('a[href]'));
+    return anchors.find(a => a.href.includes(host)) || null;
+  }, targetHost);
+
+  const element = linkHandle.asElement();
+  if (element) {
+    const success = await physicalClick(page, element, tabIndex);
+    if (success) {
+        await sleep(3000);
+        await handlePopups(browser, page, tabIndex);
+        return true;
+    }
+  }
+  return false;
+}
+
+async function openRandomInternalPostAndWait(page, targetHost, minWait, maxWait, browser, tabIndex) {
+  // Find a real internal post link
+  const linkHandle = await page.evaluateHandle(() => {
+    const links = Array.from(document.querySelectorAll('a[href]'))
+      .filter(a => a.href.includes(location.hostname) && 
+                   a.href !== location.origin + '/' && 
+                   !a.href.includes('#') && 
+                   a.innerText.length > 10); // Find links with actual titles
+    return links[Math.floor(Math.random() * links.length)] || null;
+  });
+
+  const element = linkHandle.asElement();
+  if (element) {
+    console.log(`  [Tab ${tabIndex}] Clicking internal post...`);
+    const success = await physicalClick(page, element, tabIndex);
     
-    const browser = await puppeteer.launch({
-        headless: false,
-        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled']
-    });
-
-    // Start 3 concurrent sessions
-    for (let i = 1; i <= 3; i++) {
-        startSession(browser, TARGET, REF, i);
-        await new Promise(r => setTimeout(r, 12000));
+    if (success) {
+      await sleep(4000);
+      await handlePopups(browser, page, tabIndex);
+      
+      // Human behavior on the post
+      const wait = rand(minWait, maxWait);
+      const start = Date.now();
+      while (Date.now() - start < wait) {
+        await page.mouse.wheel({ deltaY: rand(200, 500) });
+        await sleep(rand(5000, 15000));
+        // Random fidget click on text
+        if (Math.random() > 0.8) {
+           await page.mouse.click(rand(100, 500), rand(200, 600));
+        }
+      }
+      return { opened: true, finalUrl: await page.url() };
     }
+  }
+  return { opened: false, finalUrl: null };
 }
 
-run();
+/* ---------- Main Core (Modified for the new Flow) ---------- */
+// [Keeping the CLI and Runner Logic from your original script...]
+
+// NOTE: Replace your current 'simulate' logic inside the main loop with this:
+// (Pseudo-code for the specific section inside your for-loop)
+
+/* 1) await page.goto(cfg.referrer)
+  2) await waitOnReferrer(...)
+  3) refClicked = await clickLinkToTarget(page, targetHost, browser, tabIndex)
+  4) if (refClicked) { 
+        await partialRandomScroll(page);
+        await openRandomInternalPostAndWait(page, targetHost, cfg.minWait, cfg.maxWait, browser, tabIndex);
+     }
+*/
+
+// [The rest of your logging and runner code remains compatible with these functions]
