@@ -1,9 +1,8 @@
 /**
- * testbot_elite.js
- * * - Multi-Personality System: Random stay durations (1 min to 1 hour)
- * - Intelligent Internal Navigation: Follows multiple links for long-stay users
- * - Advanced Human Mimicry: Text selection (highlighting) and coordinate-based clicks
- * - Redirection Handling: Automatically follows X.com redirects to new tabs
+ * testbot_physical_elite.js
+ * - Target: learnblogs.online
+ * - Focus: 100% Coordinate-based physical clicks
+ * - No internal URL scraping; it clicks what it "sees"
  */
 
 const puppeteer = require('puppeteer-extra');
@@ -14,162 +13,129 @@ puppeteer.use(require('puppeteer-extra-plugin-stealth')());
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---------- Elite Human Actions ---------- */
+/* ---------- THE REAL PHYSICAL CLICKER ---------- */
 
-async function physicalClick(page, element) {
+/**
+ * This function finds a link on the screen, scrolls it into view, 
+ * calculates its REAL screen coordinates, and moves the mouse there to click.
+ */
+async function findAndPhysicalClick(page, selector) {
     try {
-        const box = await element.boundingBox();
-        if (box) {
-            const x = box.x + box.width / 2 + rand(-5, 5);
-            const y = box.y + box.height / 2 + rand(-5, 5);
-            await page.mouse.move(x, y, { steps: rand(15, 30) });
-            await sleep(rand(200, 600));
-            await page.mouse.click(x, y);
-            return true;
-        }
-    } catch (e) { return false; }
-    return false;
-}
+        // Find all visible elements matching the selector (titles, read-more, etc.)
+        const elements = await page.$$(selector);
+        if (elements.length === 0) return false;
 
-async function highlightText(page) {
-    try {
-        const vw = page.viewport().width;
-        const vh = page.viewport().height;
-        const x = rand(100, vw - 100);
-        const y = rand(200, vh - 200);
-        await page.mouse.move(x, y, { steps: 10 });
-        await page.mouse.down();
-        await page.mouse.move(x + rand(50, 200), y + rand(-10, 10), { steps: 20 });
-        await page.mouse.up();
-        console.log("   - Interaction: Highlighted some text.");
-    } catch (e) {}
-}
+        // Pick one at random
+        const targetEl = elements[rand(0, elements.length - 1)];
 
-async function microFidget(page) {
-    const moves = rand(2, 5);
-    for (let i = 0; i < moves; i++) {
-        const vw = page.viewport().width;
-        const vh = page.viewport().height;
-        await page.mouse.move(rand(0, vw), rand(0, vh), { steps: rand(5, 15) });
-        if (Math.random() > 0.9) await page.mouse.click(rand(0, vw), rand(0, vh)); 
-        await sleep(rand(1000, 5000));
+        // 1. Scroll it into the middle of the screen so it's "visible" to the user
+        await targetEl.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+        await sleep(rand(1000, 2000));
+
+        // 2. Get the exact bounding box (x, y, width, height)
+        const box = await targetEl.boundingBox();
+        if (!box || box.width === 0 || box.height === 0) return false;
+
+        // 3. Calculate a random point inside that box (avoiding the exact edges)
+        const clickX = box.x + (box.width / 2) + rand(-5, 5);
+        const clickY = box.y + (box.height / 2) + rand(-5, 5);
+
+        // 4. Move the mouse in a human-like path to those coordinates
+        await page.mouse.move(clickX, clickY, { steps: rand(15, 25) });
+        await sleep(rand(300, 700));
+
+        // 5. Perform the hardware-level click
+        await page.mouse.click(clickX, clickY, { delay: rand(50, 150) });
+        
+        console.log(`   - Physical Click successful at [${Math.round(clickX)}, ${Math.round(clickY)}]`);
+        return true;
+    } catch (e) {
+        console.log("   - Physical Click failed.");
+        return false;
     }
 }
 
-/* ---------- Session Logic ---------- */
+async function runEliteSession(runId) {
+    const targetUrl = 'https://learnblogs.online';
+    const referrerUrl = 'https://x.com/GhostReacondev/status/2024921591520641247?s=20';
+    const profileDir = path.join(__dirname, `session_${Date.now()}`);
 
-async function runEliteSession(target, referrer, runId, tabId) {
-    const targetHost = new URL(target).hostname;
-    const profileDir = path.join(__dirname, `profile_${Date.now()}_${tabId}`);
-    
-    // Assign Personality
+    // Randomize Personality (Stay time: 1 min up to 1 hour)
     const dice = Math.random();
-    let userType = "Reader"; // Default
-    let totalStayTime = rand(300000, 900000); // 5-15 mins
-
-    if (dice < 0.2) {
-        userType = "Bouncer";
-        totalStayTime = rand(45000, 90000); // 45-90 secs
-    } else if (dice > 0.85) {
-        userType = "Super-Fan";
-        totalStayTime = rand(1800000, 3600000); // 30-60 mins
-    }
-
-    console.log(`[Run ${runId} | Tab ${tabId}] Personality: ${userType} (${Math.round(totalStayTime/60000)}m stay)`);
+    let stayTime = rand(300000, 900000); // Default 5-15 mins
+    if (dice < 0.15) stayTime = rand(45000, 120000); // Bouncer
+    if (dice > 0.85) stayTime = rand(1800000, 3600000); // Long Reader
 
     const browser = await puppeteer.launch({
-        headless: false,
+        headless: false, // Keep false so you can watch the mouse move
         userDataDir: profileDir,
         args: ['--no-sandbox', '--start-maximized']
     });
 
     try {
         const page = await browser.newPage();
-        await page.setViewport({ width: 1536, height: 864 });
+        await page.setViewport({ width: 1920, height: 1080 });
 
-        // 1. Visit Referrer (X.com)
-        await page.goto(referrer, { waitUntil: 'networkidle2', timeout: 60000 });
-        await sleep(rand(10000, 20000));
+        // Step 1: X.com Referrer
+        await page.goto(referrerUrl, { waitUntil: 'networkidle2' });
+        await sleep(rand(10000, 15000));
 
-        // 2. Click to Target & Handle Tab Redirection
+        // Step 2: Physical click on the link within X.com
+        // We listen for the new tab because X opens links in new windows
         const newTabPromise = new Promise(resolve => browser.once('targetcreated', target => resolve(target.page())));
-        const links = await page.$$('a');
-        let clicked = false;
-        for (const link of links) {
-            const href = await page.evaluate(el => el.href, link);
-            if (href && href.includes(targetHost)) {
-                clicked = await physicalClick(page, link);
-                break;
-            }
+        
+        // On X, links usually have specific classes or are within the tweet text
+        const xLinkFound = await findAndPhysicalClick(page, 'article a[href*="learnblogs.online"]');
+        
+        let blogPage;
+        if (xLinkFound) {
+            blogPage = await Promise.race([newTabPromise, sleep(7000).then(() => null)]);
         }
 
-        let activePage = await Promise.race([newTabPromise, sleep(6000).then(() => null)]);
-        if (activePage) {
-            await page.close();
+        if (!blogPage) {
+            console.log("   - Direct click failed or no new tab. Forcing navigation...");
+            blogPage = page;
+            await blogPage.goto(targetUrl, { referer: referrerUrl, waitUntil: 'networkidle2' });
         } else {
-            activePage = page;
-            if (!clicked) await activePage.goto(target, { referer: referrer, waitUntil: 'networkidle2' });
+            await page.close(); // Close X tab
         }
 
-        await activePage.bringToFront();
-        const sessionStart = Date.now();
+        await blogPage.bringToFront();
+        const startTime = Date.now();
 
-        // 3. Main Engagement Loop
-        while (Date.now() - sessionStart < totalStayTime) {
-            // Scroll & Read
-            await activePage.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 600 + 100)));
+        // Step 3: Interaction Loop on learnblogs.online
+        while (Date.now() - startTime < stayTime) {
+            // Random Scroll
+            const scrollAmt = rand(200, 600);
+            await blogPage.evaluate((y) => window.scrollBy(0, y), scrollAmt);
             await sleep(rand(5000, 15000));
-            await microFidget(activePage);
 
-            // Special actions for long stays
-            if (userType !== "Bouncer") {
-                if (Math.random() > 0.7) await highlightText(activePage);
-                
-                // Click Internal Link if enough time passed
-                if (Math.random() > 0.8) {
-                    const internal = await activePage.$$('article a, .entry-title a, .read-more');
-                    if (internal.length > 0) {
-                        console.log(`   - ${userType} is clicking to another post...`);
-                        await physicalClick(activePage, internal[rand(0, internal.length - 1)]);
-                        await sleep(rand(5000, 10000)); // wait for load
-                    }
-                }
+            // Human Fidget: Random mouse movements
+            await blogPage.mouse.move(rand(100, 1000), rand(100, 800), { steps: 10 });
+
+            // Random Internal Click (Looking for Titles or "Read More" buttons)
+            // This is a REAL physical click based on coordinates
+            if (Math.random() > 0.7) {
+                console.log("   - Attempting a real physical click on a post title...");
+                await findAndPhysicalClick(blogPage, 'h1 a, h2 a, .entry-title a, .read-more');
+                await sleep(rand(10000, 20000)); // Stay on the new post
             }
 
-            // Check for exit
-            if (userType === "Bouncer" && (Date.now() - sessionStart > totalStayTime)) break;
+            if (Date.now() - startTime > stayTime) break;
         }
-
-        console.log(`   - ${userType} Session finished naturally.`);
 
     } catch (err) {
-        console.log(`   - Error: ${err.message}`);
+        console.log(`Error: ${err.message}`);
     } finally {
         await browser.close();
         if (fs.existsSync(profileDir)) fs.rmSync(profileDir, { recursive: true, force: true });
     }
 }
 
-/* ---------- Execution ---------- */
-const CFG = {
-    target: 'https://learnblogs.online',
-    referrer: 'https://x.com/GhostReacondev/status/2024921591520641247?s=20',
-    runs: 5,
-    maxTabs: 3 // Keep this low if sessions are 1 hour long to avoid crashing your RAM
-};
-
+// Start
 (async () => {
-    for (let r = 1; r <= CFG.runs; r++) {
-        const sessionPromises = [];
-        const tabCount = rand(1, CFG.maxTabs);
-        
-        for (let t = 1; t <= tabCount; t++) {
-            sessionPromises.push(runEliteSession(CFG.target, CFG.referrer, r, t));
-            await sleep(rand(5000, 15000)); // Stagger tab launches
-        }
-        
-        await Promise.all(sessionPromises);
-        console.log(`--- Run ${r} Complete ---`);
-        await sleep(30000); 
+    for (let i = 1; i <= 5; i++) {
+        await runEliteSession(i);
+        await sleep(rand(15000, 30000));
     }
 })();
