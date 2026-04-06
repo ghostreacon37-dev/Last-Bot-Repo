@@ -22,7 +22,7 @@ while [ $(date +%s) -lt $END_TIME ]; do
     # 2. Execute the Bot Loop
     for i in $(seq 1 $RUN_COUNT); do
         echo "👤 Starting Session #$i of $RUN_COUNT..."
-        node trafficbot.js "https://www.learnblogs.online" "https://x.com/GhostReacondev/status/2024921591520641247?s=20" 10 2 6
+        node testbot.js "https://www.learnblogs.online" "https://x.com/GhostReacondev/status/2024921591520641247?s=20" 10 2 6
         
         # Short human pause between sessions (30s to 2mins)
         INTER_SESSION_PAUSE=$((30 + RANDOM % 90))
