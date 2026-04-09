@@ -727,26 +727,99 @@ async function humanClick(page, target, cfg = {}) {
 }
 
 /**
- * Click a random post/article on learnblogs.online with human-like behavior
- * Returns true if a click was performed
+ * ENHANCED: Human-like curious scrolling behavior
+ * Simulates reading by scrolling with variable speeds and occasional pauses
  */
-async function clickLearnBlogsPost(page, cfg) {
+async function humanCuriousScroll(page, cfg) {
+  const scrollHeight = await page.evaluate(() => document.body.scrollHeight);
+  const viewportHeight = await page.evaluate(() => window.innerHeight);
+  const maxScroll = Math.max(0, scrollHeight - viewportHeight);
+  
+  if (maxScroll <= 0) return;
+  
+  let currentY = await page.evaluate(() => window.scrollY);
+  const targetY = Math.min(currentY + rand(300, 800), maxScroll);
+  
+  // Scroll in segments with pauses (reading behavior)
+  let segments = rand(3, 6);
+  const step = (targetY - currentY) / segments;
+  
+  for (let i = 0; i < segments; i++) {
+    currentY += step + rand(-50, 50);
+    currentY = Math.max(0, Math.min(currentY, maxScroll));
+    
+    await page.evaluate(y => window.scrollTo(0, y), currentY);
+    
+    // Random pause between scrolls (reading time)
+    if (Math.random() < 0.7) {
+      await sleep(rand(800, 2500));
+    }
+    
+    // Sometimes scroll back up a bit (curious behavior)
+    if (Math.random() < 0.3 && i < segments - 1) {
+      const backUp = rand(50, 150);
+      currentY = Math.max(0, currentY - backUp);
+      await page.evaluate(y => window.scrollTo(0, y), currentY);
+      await sleep(rand(500, 1200));
+      currentY += backUp; // Continue down
+      await page.evaluate(y => window.scrollTo(0, y), currentY);
+    }
+  }
+  
+  return currentY;
+}
+
+/**
+ * ENHANCED: Click a random post/article on learnblogs.online with human-like behavior
+ * Now includes clicking within the post after navigation
+ */
+async function clickLearnBlogsPost(page, cfg, isDeepDive = false) {
   try {
     const url = await page.url().catch(() => '');
     if (!url.includes('learnblogs.online')) return false;
     
-    // Multiple selectors to find post links
-    const selectors = [
-      'article h2 a', '.post-title a', '.entry-title a',
-      '.post h2 a', '.post h3 a', 'h2.entry-title a',
-      'article .entry-title a', '.blog-post h2 a',
-      '.post-entry a', 'main article a[href*="/"]',
-      'article a[rel="bookmark"]', '.entry-header a',
-      'h1 a', 'h2 a', '.content h2 a'
-    ];
+    const isHomepage = url === 'https://learnblogs.online/' || 
+                       url === 'https://learnblogs.online' ||
+                       url.endsWith('/page/') ||
+                       url.includes('/page/');
     
-    const postData = await page.evaluate((selList) => {
-      // Collect all valid post links
+    let selectors;
+    let context;
+    
+    if (isHomepage && !isDeepDive) {
+      // On homepage - look for post titles/links
+      selectors = [
+        'article h2 a', '.post-title a', '.entry-title a',
+        '.post h2 a', '.post h3 a', 'h2.entry-title a',
+        'article .entry-title a', '.blog-post h2 a',
+        '.post-entry a', 'main article a[href*="/"]',
+        'article a[rel="bookmark"]', '.entry-header a',
+        'h1 a', 'h2 a', '.content h2 a',
+        '.entry-content h2 a', '.archive-post a'
+      ];
+      context = 'homepage';
+    } else {
+      // On individual post page - look for related posts, tags, or internal links
+      selectors = [
+        // Related posts sections
+        '.related-posts a', '.related-post a', '.related a',
+        '.post-navigation a', '.nav-previous a', '.nav-next a',
+        // Tags and categories
+        '.entry-tags a', '.tag-links a', '.cat-links a',
+        '.tags a', '.post-tags a',
+        // Author bio
+        '.author-link', '.author-bio a',
+        // Comments section (if interested)
+        '.comment-author a', '.reply a',
+        // Internal links within content
+        '.entry-content a[href*="learnblogs.online"]',
+        '.post-content a[href*="learnblogs.online"]',
+        'article a[href*="learnblogs.online"]'
+      ];
+      context = 'post-page';
+    }
+    
+    const postData = await page.evaluate((selList, ctx) => {
       const candidates = [];
       for (const sel of selList) {
         const links = Array.from(document.querySelectorAll(sel));
@@ -754,19 +827,18 @@ async function clickLearnBlogsPost(page, cfg) {
           const href = link.href || '';
           const rect = link.getBoundingClientRect();
           
-          // Validate: visible, internal link, not current page, not admin
+          // Skip if not visible
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.top < 0 || rect.left < 0) continue;
+          if (rect.top > window.innerHeight - 50) continue; // Below fold
+          
+          // Validation based on context
           if (href.includes('learnblogs.online') && 
               !href.includes('#') && 
               !href.includes('wp-admin') &&
               !href.includes('wp-login') &&
               !href.includes('javascript:') &&
               !href.includes('xmlrpc') &&
-              rect.width > 0 && 
-              rect.height > 0 &&
-              rect.top >= 50 && // Not at very top (avoid headers)
-              rect.left >= 0 &&
-              rect.bottom <= (window.innerHeight - 50) && // Not behind footer
-              rect.right <= window.innerWidth &&
               href !== window.location.href) {
             
             candidates.push({
@@ -775,41 +847,45 @@ async function clickLearnBlogsPost(page, cfg) {
               width: rect.width,
               height: rect.height,
               text: link.textContent.trim().substring(0, 40),
-              href: href
+              href: href,
+              element: ctx
             });
           }
         }
       }
       
       if (candidates.length === 0) return null;
-      // Pick random candidate
-      return candidates[Math.floor(Math.random() * candidates.length)];
-    }, selectors);
+      // Pick random candidate, preferring those in viewport
+      const inViewport = candidates.filter(c => 
+        c.y > 100 && c.y < window.innerHeight - 100
+      );
+      const pool = inViewport.length > 0 ? inViewport : candidates;
+      return pool[Math.floor(Math.random() * pool.length)];
+    }, selectors, context);
     
-    if (!postData) return false;
+    if (!postData) {
+      if (cfg.debug) log('debug', `No clickable posts found on ${context}`);
+      return false;
+    }
     
-    if (cfg.debug) log('debug', `LearnBlogs engagement click: "${postData.text}..."`);
+    if (cfg.debug) log('debug', `Clicking ${context} post: "${postData.text}..." -> ${postData.href}`);
     
-    // Perform human-like click
+    // Perform human-like click with extra care (as if curious)
     const clicked = await humanClick(page, postData, cfg);
     if (!clicked) return false;
     
-    // Wait after click (simulating reading)
-    await sleep(rand(3000, 8000));
-    
-    // Check if we navigated to the post
-    const newUrl = await page.url().catch(() => url);
-    if (newUrl !== url && newUrl.includes('learnblogs.online')) {
-      // Successfully navigated to a post - scroll and engage
-      await inertialScroll(page);
-      await sleep(rand(2000, 5000));
-      
-      // 70% chance to go back to continue browsing more posts
-      if (Math.random() < 0.7) {
-        await page.goBack({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
-        await sleep(rand(1000, 3000));
+    // Wait for navigation if it's a link
+    if (postData.href && postData.href !== url) {
+      try {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 });
+        if (cfg.debug) log('debug', `Navigated to new post`);
+      } catch (e) {
+        // Navigation might not happen if it's a same-page anchor or ajax
       }
     }
+    
+    // Human reading behavior after click
+    await sleep(rand(2000, 5000));
     
     return true;
   } catch (e) {
@@ -959,15 +1035,15 @@ async function waitWithActivity(page, durationMs, cfg, engagement) {
   const isLearnBlogs = await page.evaluate(() => window.location.hostname.includes('learnblogs.online'));
   
   // For learnblogs.online: calculate number of post clicks based on wait duration
-  // More wait time = more clicks (roughly 1 click per 35-50 seconds)
+  // More wait time = more clicks (roughly 1 click per 25-35 seconds)
   let lbClicksTarget = 0;
   let lbNextClickTime = start + 99999999; // Default: far future
   
   if (isLearnBlogs) {
     const seconds = durationMs / 1000;
-    lbClicksTarget = Math.max(1, Math.floor(seconds / 45) + rand(-1, 2));
-    lbNextClickTime = start + rand(15000, 30000); // First click after 15-30s
-    if (cfg.debug) log('debug', `LearnBlogs engagement mode: ${lbClicksTarget} post clicks planned over ${Math.round(seconds)}s`);
+    lbClicksTarget = Math.max(2, Math.floor(seconds / 30) + rand(0, 2)); // At least 2 clicks
+    lbNextClickTime = start + rand(8000, 15000); // First click after 8-15s (quick engagement)
+    if (cfg.debug) log('debug', `LearnBlogs engagement: ${lbClicksTarget} post clicks planned`);
   }
   
   while (Date.now() - start < durationMs) {
@@ -977,6 +1053,21 @@ async function waitWithActivity(page, durationMs, cfg, engagement) {
       if (success) {
         engagement.learnBlogsClicks = (engagement.learnBlogsClicks || 0) + 1;
         lbClicksTarget--;
+        
+        // After clicking a post, do curious scrolling on the new page
+        await humanCuriousScroll(page, cfg);
+        
+        // 60% chance to click again on this post (deep dive)
+        if (Math.random() < 0.6 && lbClicksTarget > 0) {
+          await sleep(rand(3000, 6000));
+          const deepClick = await clickLearnBlogsPost(page, cfg, true);
+          if (deepClick) {
+            engagement.learnBlogsClicks++;
+            lbClicksTarget--;
+            await humanCuriousScroll(page, cfg);
+          }
+        }
+        
         if (cfg.debug) log('debug', `LearnBlogs click completed. Remaining: ${lbClicksTarget}`);
       } else if (cfg.debug) {
         log('debug', 'LearnBlogs click attempt failed (no eligible posts)');
@@ -984,7 +1075,7 @@ async function waitWithActivity(page, durationMs, cfg, engagement) {
       
       // Schedule next click or disable if done
       if (lbClicksTarget > 0) {
-        lbNextClickTime = Date.now() + rand(20000, 40000); // Next click in 20-40s
+        lbNextClickTime = Date.now() + rand(15000, 25000); // Next click in 15-25s
       } else {
         lbNextClickTime = Date.now() + 99999999;
       }
@@ -1008,7 +1099,12 @@ async function waitWithActivity(page, durationMs, cfg, engagement) {
     }
     
     if (Math.random() < 0.2) {
-      await inertialScroll(page);
+      // Use human curious scroll for learnblogs, regular inertial for others
+      if (isLearnBlogs) {
+        await humanCuriousScroll(page, cfg);
+      } else {
+        await inertialScroll(page);
+      }
       engagement.scrollEvents++;
       await checkAdViewability(page);
     }
@@ -1473,7 +1569,12 @@ function appendCSV(row, cfg) {
           }
           
           // On target homepage
-          await inertialScroll(page);
+          // Use human curious scroll for learnblogs to simulate reading
+          if (targetHost.includes('learnblogs.online')) {
+            await humanCuriousScroll(page, cfg);
+          } else {
+            await inertialScroll(page);
+          }
           engagement.scrollEvents++;
           
           const homeWait = gaussianRandom(150000, 45000, 30000, 480000);
@@ -1504,7 +1605,11 @@ function appendCSV(row, cfg) {
             const needed = Math.max(0, 30000 - elapsed);
             if (needed > 0) await waitWithActivity(page, needed, cfg, engagement);
             while (engagement.scrollEvents < 2) {
-              await inertialScroll(page);
+              if (targetHost.includes('learnblogs.online')) {
+                await humanCuriousScroll(page, cfg);
+              } else {
+                await inertialScroll(page);
+              }
               engagement.scrollEvents++;
             }
             while (engagement.mouseBursts < 1) {
