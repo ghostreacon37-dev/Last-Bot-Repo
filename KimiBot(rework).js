@@ -367,17 +367,71 @@ function selectReferrer(referrers) {
   return weightedRandom(items, weights);
 }
 
-/* ---------- Profile Pool Management ---------- */
+/* ---------- Profile Lock Cleanup (ADD THIS FUNCTION) ---------- */
 
-function getProfilePoolDir(cfg) {
-  return cfg.profilePool || path.join('/tmp', 'testbot_profiles');
+function cleanProfileLocks(profileDir) {
+  try {
+    const lockFiles = [
+      'SingletonLock', 
+      'SingletonCookie', 
+      'SingletonSocket', 
+      'LOCK',
+      '.lock',
+      'chrome_shutdown_ms.txt'
+    ];
+    
+    for (const file of lockFiles) {
+      const filePath = path.join(profileDir, file);
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.rmSync(filePath, { recursive: true, force: true });
+        } catch (e) {
+          // Ignore individual file errors
+        }
+      }
+    }
+    
+    // Also clean crashpad and GPUCache which can cause issues
+    const dirsToClean = ['Crashpad', 'GPUCache', 'Session Storage', 'Local Storage'];
+    for (const dir of dirsToClean) {
+      const dirPath = path.join(profileDir, dir);
+      if (fs.existsSync(dirPath)) {
+        try {
+          fs.rmSync(dirPath, { recursive: true, force: true });
+        } catch (e) {
+          // Ignore
+        }
+      }
+    }
+    
+    // Remove any .org.chromium.Chromium.* files (socket files)
+    if (fs.existsSync(profileDir)) {
+      const files = fs.readdirSync(profileDir);
+      for (const file of files) {
+        if (file.startsWith('.org.chromium.') || file.startsWith('Temp-')) {
+          try {
+            fs.rmSync(path.join(profileDir, file), { recursive: true, force: true });
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore cleanup errors
+  }
 }
+
+/* ---------- Profile Pool Management (UPDATED) ---------- */
 
 function saveProfileToPool(profileDir, poolDir, profileId) {
   const targetDir = path.join(poolDir, profileId);
   try {
     if (!fs.existsSync(poolDir)) fs.mkdirSync(poolDir, { recursive: true });
+    
+    // Clean locks BEFORE copying to pool
+    cleanProfileLocks(profileDir);
+    
     if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true });
+    
     fs.cpSync(profileDir, targetDir, { recursive: true });
     return true;
   } catch (e) {
@@ -399,812 +453,10 @@ function getRandomProfileFromPool(poolDir) {
   }
 }
 
-/* ---------- Browser Setup & Evasion ---------- */
-
-async function setupPageEvasion(page, profile, cfg) {
-  const timezone = GEO_TIMEZONES[cfg.geo] || 'America/New_York';
-  
-  await page.evaluateOnNewDocument((tz) => {
-    Intl.DateTimeFormat = class extends Intl.DateTimeFormat {
-      constructor(...args) {
-        super(...args);
-        this.resolvedOptions = () => ({ ...super.resolvedOptions(), timeZone: tz });
-      }
-    };
-  }, timezone);
-
-  await page.evaluateOnNewDocument(() => {
-    const pc = window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
-    if (pc) {
-      window.RTCPeerConnection = function(...args) {
-        const conn = new pc(...args);
-        const createDataChannel = conn.createDataChannel.bind(conn);
-        conn.createDataChannel = (...dcArgs) => {
-          const channel = createDataChannel(...dcArgs);
-          Object.defineProperty(channel, 'local', { get: () => null });
-          return channel;
-        };
-        return conn;
-      };
-    }
-  });
-
-  await page.evaluateOnNewDocument(() => {
-    const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    const originalToBlob = HTMLCanvasElement.prototype.toBlob;
-    
-    const noise = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      const imageData = ctx.createImageData(1, 1);
-      imageData.data[0] = Math.floor(Math.random() * 10);
-      imageData.data[1] = Math.floor(Math.random() * 10);
-      imageData.data[2] = Math.floor(Math.random() * 10);
-      imageData.data[3] = 255;
-      ctx.putImageData(imageData, 0, 0);
-    };
-    
-    HTMLCanvasElement.prototype.toDataURL = function(...args) {
-      noise();
-      return originalToDataURL.apply(this, args);
-    };
-    
-    HTMLCanvasElement.prototype.toBlob = function(callback, ...args) {
-      noise();
-      return originalToBlob.apply(this, [callback, ...args]);
-    };
-  });
-
-  await page.evaluateOnNewDocument((glVendor, glRenderer) => {
-    const getParam = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(param) {
-      if (param === 37445) return glVendor;
-      if (param === 37446) return glRenderer;
-      return getParam.call(this, param);
-    };
-  }, profile.webgl.vendor, profile.webgl.renderer);
-
-  await page.evaluateOnNewDocument((prof) => {
-    Object.defineProperty(navigator, 'platform', { get: () => prof.platform });
-    Object.defineProperty(navigator, 'vendor', { get: () => prof.vendor });
-    if (prof.oscpu) Object.defineProperty(navigator, 'oscpu', { get: () => prof.oscpu });
-    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => prof.maxTouchPoints });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => prof.deviceMemory });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => prof.hardwareConcurrency });
-    Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-  }, profile);
-
-  await page.evaluateOnNewDocument(() => {
-    const originalCheck = document.fonts.check;
-    const fonts = ['Arial', 'Times New Roman', 'Helvetica', 'Georgia', 'Verdana', 'Courier New'];
-    document.fonts.check = function(...args) {
-      if (Math.random() < 0.3) return fonts[Math.floor(Math.random() * fonts.length)] === args[0];
-      return originalCheck.apply(this, args);
-    };
-  });
-
-  await page.evaluateOnNewDocument(() => {
-    const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-    AudioBuffer.prototype.getChannelData = function(channel) {
-      const data = originalGetChannelData.call(this, channel);
-      for (let i = 0; i < data.length; i++) {
-        if (i % 100 === 0) data[i] += (Math.random() - 0.5) * 0.0001;
-      }
-      return data;
-    };
-  });
-
-  await page.evaluateOnNewDocument((prof) => {
-    Object.defineProperty(window.screen, 'width', { get: () => prof.screen.width });
-    Object.defineProperty(window.screen, 'height', { get: () => prof.screen.height });
-    Object.defineProperty(window.screen, 'colorDepth', { get: () => prof.screen.colorDepth });
-    Object.defineProperty(window.screen, 'availWidth', { get: () => prof.screen.width });
-    Object.defineProperty(window.screen, 'availHeight', { get: () => prof.screen.height - 40 });
-    Object.defineProperty(window, 'outerWidth', { get: () => prof.screen.width });
-    Object.defineProperty(window, 'outerHeight', { get: () => prof.screen.height });
-    Object.defineProperty(window, 'screenX', { get: () => 0 });
-    Object.defineProperty(window, 'screenY', { get: () => 0 });
-    Object.defineProperty(window, 'screenLeft', { get: () => 0 });
-    Object.defineProperty(window, 'screenTop', { get: () => 0 });
-  }, profile);
-
-  // Request interception - blocking tracking/verification only
-  await page.setRequestInterception(true);
-  
-  page.on('request', (req) => {
-    const url = req.url();
-    
-    // Block tracking/verification scripts only
-    for (const pattern of BLOCKED_URL_PATTERNS) {
-      if (pattern.test(url)) {
-        return req.abort();
-      }
-    }
-    
-    req.continue();
-  });
-}
-
-/* ---------- Advanced Behavioral Actions ---------- */
-
-async function bezierMouseMove(page, x1, y1, x2, y2, duration = 1000) {
-  const steps = Math.max(10, Math.floor(duration / 16));
-  const cp = {
-    x: (x1 + x2) / 2 + rand(-50, 50),
-    y: (y1 + y2) / 2 + rand(-50, 50)
-  };
-  
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-    const pos = getBezierPoint(ease, {x: x1, y: y1}, cp, {x: x2, y: x2});
-    await page.mouse.move(pos.x, pos.y);
-    await sleep(duration / steps);
-  }
-}
-
-async function inertialScroll(page) {
-  const viewport = await page.viewport();
-  const scrollHeight = await page.evaluate(() => document.body.scrollHeight);
-  const maxScroll = Math.max(0, scrollHeight - viewport.height);
-  
-  let currentY = await page.evaluate(() => window.scrollY);
-  const targetY = Math.min(currentY + rand(200, viewport.height), maxScroll);
-  const direction = targetY > currentY ? 1 : -1;
-  
-  let velocity = rand(15, 30) * direction;
-  const friction = 0.85;
-  
-  while (Math.abs(velocity) > 1 && currentY !== targetY) {
-    currentY += velocity;
-    velocity *= friction;
-    
-    if (Math.random() < 0.1) velocity *= -0.5;
-    
-    if (currentY < 0) { currentY = 0; break; }
-    if (currentY > maxScroll) { currentY = maxScroll; break; }
-    
-    await page.evaluate(y => window.scrollTo(0, y), currentY);
-    await sleep(rand(16, 50));
-  }
-  
-  return currentY;
-}
-
-/**
- * REAL HUMAN CLICK SIMULATION
- * This function simulates genuine human clicking behavior with:
- * - Bezier curve approach path
- * - Random targeting within element (not dead center)
- * - Pre-click hover pause (reaction time)
- * - Micro-wiggles (hand precision adjustment)
- * - Realistic mouse down/hold/up timing (80-200ms)
- * - Post-click stabilization
- */
-async function humanClick(page, target, cfg = {}) {
-  let box;
-  let elementHandle;
-  
-  // Handle different target types
-  if (typeof target === 'string') {
-    // CSS Selector
-    elementHandle = await page.$(target);
-    if (!elementHandle) {
-      if (cfg.debug) log('debug', `Human click: Selector not found ${target}`);
-      return false;
-    }
-  } else if (target && typeof target === 'object' && target.asElement) {
-    // ElementHandle
-    elementHandle = target;
-  } else if (typeof target === 'object' && target.x !== undefined && target.y !== undefined) {
-    // Coordinates object
-    box = { 
-      x: target.x, 
-      y: target.y, 
-      width: target.width || 0, 
-      height: target.height || 0 
-    };
-  }
-  
-  // Get bounding box if we have an element
-  if (elementHandle && !box) {
-    box = await elementHandle.boundingBox();
-    if (!box) {
-      if (cfg.debug) log('debug', 'Human click: Element not visible');
-      return false;
-    }
-  }
-  
-  if (!box) {
-    log('error', 'Human click: No valid target');
-    return false;
-  }
-  
-  // Calculate random click position within element (5px padding from edges)
-  const padding = 5;
-  const targetX = box.x + rand(padding, Math.max(padding, box.width - padding));
-  const targetY = box.y + rand(padding, Math.max(padding, box.height - padding));
-  
-  // Get current mouse position (tracked via window.mouseX/Y)
-  const currentPos = await page.evaluate(() => ({
-    x: window.mouseX || window.innerWidth / 2,
-    y: window.mouseY || window.innerHeight / 2
-  }));
-  
-  // Move to target with Bezier curve (slower, more precise for clicking)
-  const moveDuration = rand(800, 1500);
-  await bezierMouseMove(page, currentPos.x, currentPos.y, targetX, targetY, moveDuration);
-  
-  // Pre-click pause (human reaction time to target acquisition)
-  await sleep(rand(100, 400));
-  
-  // Micro-wiggles (hand adjusting for precision)
-  for (let i = 0; i < rand(2, 5); i++) {
-    const wiggleX = targetX + rand(-3, 3);
-    const wiggleY = targetY + rand(-3, 3);
-    await page.mouse.move(wiggleX, wiggleY);
-    await sleep(rand(20, 80));
-  }
-  
-  // Final precise positioning
-  await page.mouse.move(targetX, targetY);
-  
-  // Realistic click timing
-  await page.mouse.down();
-  await sleep(rand(80, 200)); // Human finger press duration
-  await page.mouse.up();
-  
-  // Update tracked mouse position globally
-  await page.evaluate((x, y) => {
-    window.mouseX = x;
-    window.mouseY = y;
-  }, targetX, targetY);
-  
-  // Post-click pause (hand lingering before moving away)
-  await sleep(rand(50, 300));
-  
-  if (cfg.debug) log('debug', `Human click executed at ${Math.round(targetX)},${Math.round(targetY)}`);
-  return true;
-}
-
-/**
- * Click a random post/article on learnblogs.online with human-like behavior
- * Returns true if a click was performed
- */
-async function clickLearnBlogsPost(page, cfg) {
-  try {
-    const url = await page.url().catch(() => '');
-    if (!url.includes('learnblogs.online')) return false;
-    
-    // Multiple selectors to find post links
-    const selectors = [
-      'article h2 a', '.post-title a', '.entry-title a',
-      '.post h2 a', '.post h3 a', 'h2.entry-title a',
-      'article .entry-title a', '.blog-post h2 a',
-      '.post-entry a', 'main article a[href*="/"]',
-      'article a[rel="bookmark"]', '.entry-header a',
-      'h1 a', 'h2 a', '.content h2 a'
-    ];
-    
-    const postData = await page.evaluate((selList) => {
-      // Collect all valid post links
-      const candidates = [];
-      for (const sel of selList) {
-        const links = Array.from(document.querySelectorAll(sel));
-        for (const link of links) {
-          const href = link.href || '';
-          const rect = link.getBoundingClientRect();
-          
-          // Validate: visible, internal link, not current page, not admin
-          if (href.includes('learnblogs.online') && 
-              !href.includes('#') && 
-              !href.includes('wp-admin') &&
-              !href.includes('wp-login') &&
-              !href.includes('javascript:') &&
-              !href.includes('xmlrpc') &&
-              rect.width > 0 && 
-              rect.height > 0 &&
-              rect.top >= 50 && // Not at very top (avoid headers)
-              rect.left >= 0 &&
-              rect.bottom <= (window.innerHeight - 50) && // Not behind footer
-              rect.right <= window.innerWidth &&
-              href !== window.location.href) {
-            
-            candidates.push({
-              x: rect.x,
-              y: rect.y,
-              width: rect.width,
-              height: rect.height,
-              text: link.textContent.trim().substring(0, 40),
-              href: href
-            });
-          }
-        }
-      }
-      
-      if (candidates.length === 0) return null;
-      // Pick random candidate
-      return candidates[Math.floor(Math.random() * candidates.length)];
-    }, selectors);
-    
-    if (!postData) return false;
-    
-    if (cfg.debug) log('debug', `LearnBlogs engagement click: "${postData.text}..."`);
-    
-    // Perform human-like click
-    const clicked = await humanClick(page, postData, cfg);
-    if (!clicked) return false;
-    
-    // Wait after click (simulating reading)
-    await sleep(rand(3000, 8000));
-    
-    // Check if we navigated to the post
-    const newUrl = await page.url().catch(() => url);
-    if (newUrl !== url && newUrl.includes('learnblogs.online')) {
-      // Successfully navigated to a post - scroll and engage
-      await inertialScroll(page);
-      await sleep(rand(2000, 5000));
-      
-      // 70% chance to go back to continue browsing more posts
-      if (Math.random() < 0.7) {
-        await page.goBack({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
-        await sleep(rand(1000, 3000));
-      }
-    }
-    
-    return true;
-  } catch (e) {
-    if (cfg.debug) log('debug', `LearnBlogs click error: ${e.message}`);
-    return false;
-  }
-}
-
-async function simulateTextSelection(page) {
-  try {
-    const textInfo = await page.evaluate(() => {
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-      const texts = [];
-      let node;
-      while (node = walker.nextNode()) {
-        if (node.textContent.trim().length > 20) {
-          const rect = node.parentElement.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            texts.push({
-              text: node.textContent,
-              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-            });
-          }
-        }
-      }
-      return texts.length ? texts[Math.floor(Math.random() * texts.length)] : null;
-    });
-    
-    if (!textInfo) return;
-    
-    const startX = textInfo.rect.x + rand(5, 20);
-    const startY = textInfo.rect.y + textInfo.rect.height / 2;
-    const endX = startX + rand(50, Math.min(200, textInfo.rect.width - 10));
-    const endY = startY + rand(-5, 5);
-    
-    await page.mouse.move(startX, startY);
-    await page.mouse.down();
-    await bezierMouseMove(page, startX, startY, endX, endY, rand(300, 800));
-    await page.mouse.up();
-    
-    if (Math.random() < 0.3) {
-      await page.keyboard.down('Control');
-      await page.keyboard.down('c');
-      await page.keyboard.up('c');
-      await page.keyboard.up('Control');
-    }
-    
-    await sleep(rand(500, 1500));
-  } catch (e) {}
-}
-
-async function simulateFormInteraction(page, cfg) {
-  try {
-    const inputInfo = await page.evaluate(() => {
-      const inputs = document.querySelectorAll('input[type="search"], input[type="text"], textarea');
-      for (const input of inputs) {
-        const rect = input.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          return {
-            x: rect.x + rect.width / 2,
-            y: rect.y + rect.height / 2,
-            width: rect.width,
-            height: rect.height,
-            tag: input.tagName
-          };
-        }
-      }
-      return null;
-    });
-    
-    if (!inputInfo || Math.random() > 0.15) return;
-    
-    // Use human click to focus the input
-    await humanClick(page, {
-      x: inputInfo.x - inputInfo.width/2,
-      y: inputInfo.y - inputInfo.height/2,
-      width: inputInfo.width,
-      height: inputInfo.height
-    }, cfg);
-    
-    await sleep(rand(200, 500));
-    
-    const chars = rand(2, 6);
-    for (let i = 0; i < chars; i++) {
-      const word = WORD_LIST[Math.floor(Math.random() * WORD_LIST.length)];
-      await page.keyboard.type(word.substring(0, 1), { delay: rand(50, 150) });
-      await sleep(rand(100, 300));
-    }
-    
-    await sleep(rand(1000, 2000));
-    await page.keyboard.press('Tab');
-  } catch (e) {}
-}
-
-async function simulateReadingPause(page) {
-  const pauses = rand(1, 3);
-  for (let i = 0; i < pauses; i++) {
-    await sleep(rand(8000, 25000));
-  }
-}
-
-async function simulateTabFocusBlur(page) {
-  const events = rand(1, 2);
-  for (let i = 0; i < events; i++) {
-    await sleep(rand(5000, 15000));
-    await page.evaluate(() => {
-      Object.defineProperty(document, 'visibilityState', { value: 'hidden', writable: true });
-      document.dispatchEvent(new Event('visibilitychange'));
-      window.dispatchEvent(new Event('blur'));
-    });
-    await sleep(rand(5000, 15000));
-    await page.evaluate(() => {
-      Object.defineProperty(document, 'visibilityState', { value: 'visible', writable: true });
-      document.dispatchEvent(new Event('visibilitychange'));
-      window.dispatchEvent(new Event('focus'));
-    });
-  }
-}
-
-async function checkAdViewability(page) {
-  try {
-    const adInViewport = await page.evaluate((selectors) => {
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const rect = el.getBoundingClientRect();
-          const inViewport = rect.top >= 0 && rect.left >= 0 && 
-                            rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-                            rect.right <= (window.innerWidth || document.documentElement.clientWidth);
-          if (inViewport) return { x: rect.x + rect.width/2, y: rect.y + rect.height/2 };
-        }
-      }
-      return null;
-    }, AD_SELECTORS);
-    
-    if (adInViewport) {
-      await page.mouse.move(adInViewport.x + rand(-50, 50), adInViewport.y + rand(-50, 50));
-      await sleep(rand(2000, 6000));
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
-async function waitWithActivity(page, durationMs, cfg, engagement) {
-  const start = Date.now();
-  const isLearnBlogs = await page.evaluate(() => window.location.hostname.includes('learnblogs.online'));
-  
-  // For learnblogs.online: calculate number of post clicks based on wait duration
-  // More wait time = more clicks (roughly 1 click per 35-50 seconds)
-  let lbClicksTarget = 0;
-  let lbNextClickTime = start + 99999999; // Default: far future
-  
-  if (isLearnBlogs) {
-    const seconds = durationMs / 1000;
-    lbClicksTarget = Math.max(1, Math.floor(seconds / 45) + rand(-1, 2));
-    lbNextClickTime = start + rand(15000, 30000); // First click after 15-30s
-    if (cfg.debug) log('debug', `LearnBlogs engagement mode: ${lbClicksTarget} post clicks planned over ${Math.round(seconds)}s`);
-  }
-  
-  while (Date.now() - start < durationMs) {
-    // Check if we should perform a learnblogs post click
-    if (isLearnBlogs && lbClicksTarget > 0 && Date.now() >= lbNextClickTime) {
-      const success = await clickLearnBlogsPost(page, cfg);
-      if (success) {
-        engagement.learnBlogsClicks = (engagement.learnBlogsClicks || 0) + 1;
-        lbClicksTarget--;
-        if (cfg.debug) log('debug', `LearnBlogs click completed. Remaining: ${lbClicksTarget}`);
-      } else if (cfg.debug) {
-        log('debug', 'LearnBlogs click attempt failed (no eligible posts)');
-      }
-      
-      // Schedule next click or disable if done
-      if (lbClicksTarget > 0) {
-        lbNextClickTime = Date.now() + rand(20000, 40000); // Next click in 20-40s
-      } else {
-        lbNextClickTime = Date.now() + 99999999;
-      }
-    }
-    
-    if (Math.random() < 0.3) {
-      await simulateReadingPause(page);
-    }
-    
-    if (Math.random() < 0.4) {
-      const x = rand(50, (await page.viewport()).width - 50);
-      const y = rand(50, (await page.viewport()).height - 50);
-      await bezierMouseMove(page, 
-        (await page.evaluate(() => window.mouseX || 0)), 
-        (await page.evaluate(() => window.mouseY || 0)), 
-        x, y, 
-        rand(200, 800)
-      );
-      await page.evaluate((mx, my) => { window.mouseX = mx; window.mouseY = my; }, x, y);
-      engagement.mouseBursts++;
-    }
-    
-    if (Math.random() < 0.2) {
-      await inertialScroll(page);
-      engagement.scrollEvents++;
-      await checkAdViewability(page);
-    }
-    
-    if (Math.random() < 0.1) {
-      await simulateTabFocusBlur(page);
-    }
-    
-    if (Math.random() < 0.15) {
-      await simulateTextSelection(page);
-    }
-    
-    if (Math.random() < 0.05) {
-      await simulateFormInteraction(page, cfg);
-    }
-    
-    await sleep(rand(2000, 6000));
-  }
-}
-
-/* ---------- Core Action Functions with Human Clicks ---------- */
-
-async function clickLinkToTarget(page, targetHost, cfg) {
-  // First try to find direct anchors
-  const linkData = await page.evaluate((targetHost) => {
-    const anchors = Array.from(document.querySelectorAll('a[href]')).filter(a => {
-      return a.href && a.href.includes(targetHost) && a.offsetParent !== null;
-    });
-    if (!anchors.length) return null;
-    const el = anchors[Math.floor(Math.random() * anchors.length)];
-    const rect = el.getBoundingClientRect();
-    return {
-      x: rect.x,
-      y: rect.y,
-      width: rect.width,
-      height: rect.height,
-      href: el.href
-    };
-  }, targetHost);
-  
-  if (linkData) {
-    const clicked = await humanClick(page, linkData, cfg);
-    if (clicked) {
-      if (cfg.debug) log('debug', 'Human clicked direct anchor to target');
-      return true;
-    }
-  }
-  
-  // Fallback: anchors with text containing host or redirect shorteners
-  const fbData = await page.evaluate((targetHost) => {
-    const anchors = Array.from(document.querySelectorAll('a[href]')).slice(0, 80);
-    for (const a of anchors) {
-      const href = (a.href||'').toLowerCase();
-      if (href.includes('t.co') || href.includes('bit.ly') || href.includes('tinyurl')) {
-        const rect = a.getBoundingClientRect();
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      }
-      if ((a.innerText||'').toLowerCase().includes(targetHost.toLowerCase())) {
-        const rect = a.getBoundingClientRect();
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      }
-    }
-    return null;
-  }, targetHost);
-  
-  if (fbData) {
-    const clicked = await humanClick(page, fbData, cfg);
-    if (clicked && cfg.debug) log('debug', 'Human clicked fallback anchor');
-    return clicked;
-  }
-  
-  return false;
-}
-
-async function clickSafeLink(page, targetHost, cfg) {
-  const isSafeLink = (href) => {
-    for (const pattern of AFFILIATE_PATTERNS) {
-      if (pattern.test(href)) return false;
-    }
-    for (const pattern of BLOCKED_URL_PATTERNS) {
-      if (pattern.test(href)) return false;
-    }
-    return true;
-  };
-
-  const linkData = await page.evaluate((targetHost, adSelectors, isSafeFunc) => {
-    const isSafe = new Function('return ' + isSafeFunc)();
-    
-    const anchors = Array.from(document.querySelectorAll('a[href]')).filter(a => {
-      for (const sel of adSelectors) {
-        if (a.closest(sel)) return false;
-      }
-      if (!a.href.includes(targetHost)) return false;
-      if (!isSafe(a.href)) return false;
-      if (a.offsetParent === null) return false; // Not visible
-      return true;
-    });
-    
-    if (!anchors.length) return null;
-    const el = anchors[Math.floor(Math.random() * anchors.length)];
-    const rect = el.getBoundingClientRect();
-    return {
-      x: rect.x,
-      y: rect.y,
-      width: rect.width,
-      height: rect.height,
-      href: el.href
-    };
-  }, targetHost, AD_SELECTORS, isSafeLink.toString());
-  
-  if (!linkData) return false;
-  
-  // Use human click instead of instant click
-  return await humanClick(page, linkData, cfg);
-}
-
-/**
- * Now with REAL HUMAN CLICK - finds internal link and actually clicks it like a human
- * instead of using page.goto()
- */
-async function openRandomInternalPostAndWait(page, targetHost, minWait, maxWait, cfg) {
-  const isSafeLink = (href) => {
-    for (const pattern of AFFILIATE_PATTERNS) {
-      if (pattern.test(href)) return false;
-    }
-    return true;
-  };
-
-  // Find a valid internal link with coordinates
-  const linkData = await page.evaluate((targetHost, isSafeFunc) => {
-    const isSafe = new Function('return ' + isSafeFunc)();
-    const links = Array.from(document.querySelectorAll('a[href]'))
-      .filter(a => {
-        try {
-          const url = new URL(a.href);
-          return url.hostname.includes(targetHost) && 
-                 url.pathname !== '/' && 
-                 !url.hash && 
-                 isSafe(a.href) &&
-                 a.offsetParent !== null;
-        } catch { return false; }
-      });
-    
-    if (!links.length) return null;
-    const link = links[Math.floor(Math.random() * links.length)];
-    const rect = link.getBoundingClientRect();
-    return {
-      x: rect.x,
-      y: rect.y,
-      width: rect.width,
-      height: rect.height,
-      href: link.href
-    };
-  }, targetHost, isSafeLink.toString());
-  
-  if (!linkData) return { opened: false, finalUrl: await page.url().catch(()=>null) };
-  
-  try {
-    // HUMAN CLICK the link instead of using goto
-    const clicked = await humanClick(page, linkData, cfg);
-    if (!clicked) return { opened: false, finalUrl: await page.url().catch(()=>null) };
-    
-    // Wait for navigation
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
-    
-    // Partial scroll and wait
-    await inertialScroll(page);
-    
-    const wait = gaussianRandom(
-      (minWait + maxWait) / 2,
-      (maxWait - minWait) / 4,
-      minWait,
-      maxWait
-    );
-    
-    if (cfg.debug) log('debug', `Waiting on post ~${Math.round(wait/1000)}s after human click`);
-    
-    const start = Date.now();
-    while (Date.now() - start < wait) {
-      await bezierMouseMove(page, 
-        (await page.evaluate(() => window.mouseX || 0)),
-        (await page.evaluate(() => window.mouseY || 0)),
-        rand(100, 800), rand(100, 600),
-        rand(200, 800)
-      );
-      await sleep(rand(2000, 8000));
-    }
-    
-    return { opened: true, finalUrl: await page.url().catch(()=>linkData.href) };
-  } catch (e) {
-    return { opened: false, finalUrl: await page.url().catch(()=>null) };
-  }
-}
-
-/* ---------- Enhanced Logging ---------- */
-
-function appendCSV(row, cfg) {
-  try {
-    const csv = path.join(process.cwd(), 'sessions_log.csv');
-    const headers = 'timestamp,run,tab,referrer_clicked,target_final,post_opened,post_final,duration_ms,proxy_used,referrer_used,pages_visited,bounce,return_visitor,learnblogs_clicks\n';
-    
-    if (!fs.existsSync(csv)) fs.writeFileSync(csv, headers);
-    
-    const safeRow = row.map(x => `"${String(x||'').replace(/"/g, '""')}"`).join(',');
-    fs.appendFileSync(csv, safeRow + '\n');
-  } catch (e) {
-    if (cfg.debug) log('error', 'CSV write failed:', e.message);
-  }
-}
-
-/* ---------- Main Execution ---------- */
+/* ---------- Main Execution (FIXED SECTIONS) ---------- */
 
 (async () => {
-  const cfg = parseArgs();
-  
-  if (!cfg.target) {
-    console.error('Usage: node testbot.js <target_url> [referrer_url] [options] --confirm-owned');
-    console.error('   or: node testbot.js <target_url> --referrer-list=<file> [options] --confirm-owned');
-    process.exit(1);
-  }
-  
-  if (!cfg.confirmOwned) {
-    log('error', 'This script requires --confirm-owned. Only run on domains you own or have permission to test.');
-    process.exit(1);
-  }
-
-  const proxies = loadProxies(cfg);
-  const referrers = loadReferrers(cfg);
-  const targetHost = new URL(cfg.target).hostname;
-  const poolDir = getProfilePoolDir(cfg);
-  
-  if (cfg.returnRate > 0 && !fs.existsSync(poolDir)) {
-    fs.mkdirSync(poolDir, { recursive: true });
-  }
-
-  log('info', `Starting advanced tester — target: ${cfg.target}`);
-  log('info', `Runs: ${cfg.runs}${cfg.forever ? ' (forever)' : ''}, interval=${cfg.interval}ms`);
-  if (cfg.fixedInstances) log('info', `Fixed instances: ${cfg.fixedInstances}`);
-  else log('info', `Tabs per run: random ${cfg.minTabs}..${cfg.maxTabs}`);
-  if (proxies.length) log('info', `Loaded ${proxies.length} proxies`);
-  if (referrers.length) log('info', `Loaded ${referrers.length} referrers`);
-  if (cfg.schedule) log('info', `Time-of-day scheduling enabled (${cfg.geo})`);
-  
-  if (cfg.dryRun) {
-    log('warning', 'DRY RUN MODE - No browsers will be launched');
-    console.log('\nPlanned configuration:');
-    console.log(JSON.stringify({...cfg, confirmOwned: '[REDACTED]'}, null, 2));
-    process.exit(0);
-  }
-
-  let run = 0;
-  let stop = false;
-  process.on('SIGINT', () => { log('warning', 'SIGINT received — stopping after current run'); stop = true; });
-  process.on('SIGTERM', () => { log('warning', 'SIGTERM received — stopping after current run'); stop = true; });
+  // ... keep all existing code until the while loop ...
 
   while (!stop && (cfg.forever || run < cfg.runs)) {
     run++;
@@ -1231,17 +483,29 @@ function appendCSV(row, cfg) {
       const isReturn = returnVisitors[t];
       
       let profileDir;
+      let profileSource = 'fresh';
+      
       if (isReturn) {
         const existing = getRandomProfileFromPool(poolDir);
         if (existing) {
-          profileDir = path.join('/tmp', `testbot_active_${Date.now()}_${t}`);
-          fs.cpSync(existing, profileDir, { recursive: true });
-          log('debug', `Reusing profile for tab ${t+1}`);
+          // Use unique timestamp + random to avoid conflicts
+          profileDir = path.join('/tmp', `testbot_active_${Date.now()}_${rand(1000,9999)}_${t}`);
+          try {
+            fs.cpSync(existing, profileDir, { recursive: true });
+            // CRITICAL: Clean locks immediately after copying
+            cleanProfileLocks(profileDir);
+            profileSource = 'pool';
+            log('debug', `Reusing profile for tab ${t+1} (locks cleaned)`);
+          } catch (e) {
+            log('warning', `Failed to copy from pool: ${e.message}, using fresh`);
+            profileDir = path.join('/tmp', `testbot_profile_${Date.now()}_${rand(1000,9999)}_${t}`);
+            profileSource = 'fresh';
+          }
         } else {
-          profileDir = path.join('/tmp', `testbot_profile_${Date.now()}_${t}`);
+          profileDir = path.join('/tmp', `testbot_profile_${Date.now()}_${rand(1000,9999)}_${t}`);
         }
       } else {
-        profileDir = path.join('/tmp', `testbot_profile_${Date.now()}_${t}`);
+        profileDir = path.join('/tmp', `testbot_profile_${Date.now()}_${rand(1000,9999)}_${t}`);
       }
       
       const profile = UA_PROFILES[rand(0, UA_PROFILES.length - 1)];
@@ -1255,7 +519,8 @@ function appendCSV(row, cfg) {
         referrer,
         profile,
         profileDir,
-        isReturn,
+        isReturn: profileSource === 'pool',
+        profileSource,
         bounceFromReferrer,
         bounceFromHomepage,
         pagesToVisit,
@@ -1281,7 +546,11 @@ function appendCSV(row, cfg) {
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-features=WebRtcHideLocalIpsWithMdns',
-          '--disable-webrtc-encryption'
+          '--disable-webrtc-encryption',
+          // Disable backgrounding to prevent lock issues
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding'
         ];
         
         if (flow.proxy) {
@@ -1291,11 +560,28 @@ function appendCSV(row, cfg) {
           }
         }
         
+        // Double-check locks are cleaned before launch
+        cleanProfileLocks(flow.profileDir);
+        
         const browser = await puppeteer.launch({
           headless: !!cfg.headless,
           userDataDir: flow.profileDir,
           defaultViewport: null,
           args: launchArgs
+        }).catch(async (err) => {
+          if (err.message.includes('in use by another')) {
+            // If still locked, use a fresh directory
+            log('warning', `Tab ${flow.tab}: Profile locked, switching to fresh`);
+            flow.profileDir = path.join('/tmp', `testbot_emergency_${Date.now()}_${rand(1000,9999)}`);
+            flow.isReturn = false;
+            return await puppeteer.launch({
+              headless: !!cfg.headless,
+              userDataDir: flow.profileDir,
+              defaultViewport: null,
+              args: launchArgs
+            });
+          }
+          throw err;
         });
         
         browsers.push({ browser, flow });
@@ -1311,6 +597,8 @@ function appendCSV(row, cfg) {
           }
         }
       }
+      
+      // ... keep rest of execution code same ...
       
       const executions = browsers.map(async ({ browser, flow }) => {
         const start = Date.now();
@@ -1329,7 +617,6 @@ function appendCSV(row, cfg) {
             'Referer': flow.referrer
           });
           
-          // Initialize mouse tracking
           await page.evaluate(() => {
             window.mouseX = window.innerWidth / 2;
             window.mouseY = window.innerHeight / 2;
@@ -1354,7 +641,6 @@ function appendCSV(row, cfg) {
             );
             await waitWithActivity(page, refWait, cfg, engagement);
             
-            // HUMAN CLICK to target
             flow.results.refClicked = await clickLinkToTarget(page, targetHost, cfg);
             if (flow.results.refClicked) {
               await sleep(3000);
@@ -1380,7 +666,6 @@ function appendCSV(row, cfg) {
             });
           }
           
-          // On target homepage
           await inertialScroll(page);
           engagement.scrollEvents++;
           
@@ -1391,7 +676,6 @@ function appendCSV(row, cfg) {
           
           await checkAdViewability(page);
           
-          // Internal pages with HUMAN CLICKS
           if (!flow.bounceFromHomepage) {
             for (let p = 0; p < flow.pagesToVisit; p++) {
               const postResult = await openRandomInternalPostAndWait(page, targetHost, cfg.minTargetWait, cfg.maxTargetWait, cfg);
@@ -1406,7 +690,6 @@ function appendCSV(row, cfg) {
             }
           }
           
-          // Minimum engagement enforcement
           const elapsed = Date.now() - engagement.startTime;
           if (engagement.scrollEvents < 2 || engagement.mouseBursts < 1 || elapsed < 30000) {
             const needed = Math.max(0, 30000 - elapsed);
@@ -1421,7 +704,6 @@ function appendCSV(row, cfg) {
             }
           }
           
-          // Store learnblogs engagement
           flow.results.learnBlogsClicks = engagement.learnBlogsClicks || 0;
           
           if (cfg.screenshot) {
@@ -1433,11 +715,6 @@ function appendCSV(row, cfg) {
           
           flow.results.duration = Date.now() - start;
           await page.close();
-          
-          if (flow.isReturn) {
-            const poolId = `profile_${Date.now()}_${flow.tab}`;
-            saveProfileToPool(flow.profileDir, poolDir, poolId);
-          }
           
         } catch (e) {
           flow.results.duration = Date.now() - start;
@@ -1471,18 +748,28 @@ function appendCSV(row, cfg) {
     } catch (e) {
       log('error', 'Run-level error:', e.message);
     } finally {
-      for (const { browser, flow } of browsers) {
+      // Close browsers first, then handle profiles
+      for (const { browser } of browsers) {
         try { 
           await browser.close(); 
         } catch {}
-        
-        if (!flow.isReturn || !fs.existsSync(path.join(poolDir, path.basename(flow.profileDir)))) {
-          try { 
-            if (fs.existsSync(flow.profileDir)) {
-              fs.rmSync(flow.profileDir, { recursive: true, force: true });
-            }
-          } catch {}
+      }
+      
+      // Wait a bit for Chrome to fully release locks
+      await sleep(500);
+      
+      for (const { flow } of browsers) {
+        if (flow.isReturn) {
+          const poolId = `profile_${Date.now()}_${flow.tab}_${rand(1000,9999)}`;
+          saveProfileToPool(flow.profileDir, poolDir, poolId);
         }
+        
+        try { 
+          if (fs.existsSync(flow.profileDir)) {
+            cleanProfileLocks(flow.profileDir); // Clean before delete
+            fs.rmSync(flow.profileDir, { recursive: true, force: true });
+          }
+        } catch {}
       }
     }
     
@@ -1490,6 +777,8 @@ function appendCSV(row, cfg) {
       if (stop) break;
       log('info', `Waiting ${cfg.interval}ms before next run...`);
       await sleep(cfg.interval);
+      // Extra safety delay for Chrome termination
+      await sleep(500);
     } else {
       if (run >= cfg.runs) break;
       log('info', `Waiting ${cfg.interval}ms before next run...`);
